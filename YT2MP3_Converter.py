@@ -5,570 +5,580 @@
 # Components are kept locally with this program.
 # The Remove Components button removes everything this program installed/downloaded.
 
+import importlib
 import os
-import sys
+import re
+import shutil
 import subprocess
+import sys
+import tempfile
 import threading
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+import urllib.parse
 import urllib.request
 import zipfile
-import shutil
-import re
-import importlib.util
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
 
-# SETTINGS
-APP_NAME = "YouTube to MP3 Converter"
-
-# Dark mode colors
-BG_COLOR = "#1e1e1e"
-FG_COLOR = "#f0f0f0"
-ENTRY_BG = "#2b2b2b"
-BUTTON_BG = "#333333"
-BUTTON_ACTIVE = "#444444"
-STATUS_COLOR = "#00FF00"
-BORDER_COLOR = "#00FF00"
-PROGRESS_BG = "#333333"
-PROGRESS_TROUGH = "#252525"
-
-BASE_FOLDER = os.path.dirname(os.path.abspath(__file__))
-COMPONENTS_FOLDER = os.path.join(BASE_FOLDER, "components")
-YTDLP_FOLDER = os.path.join(COMPONENTS_FOLDER, "yt-dlp")
-FFMPEG_FOLDER = os.path.join(COMPONENTS_FOLDER, "ffmpeg")
-FFMPEG_BIN = os.path.join(FFMPEG_FOLDER, "bin")
-FFMPEG_EXE = os.path.join(FFMPEG_BIN, "ffmpeg.exe")
-FFPROBE_EXE = os.path.join(FFMPEG_BIN, "ffprobe.exe")
+APP_NAME = 'YouTube to MP3 Converter'
+BG = '#1e1e1e'
+FG = '#f0f0f0'
+MUTED = '#aaaaaa'
+ENTRY = '#2b2b2b'
+BUTTON = '#333333'
+GREEN = '#00ff00'
+BASE = Path(__file__).resolve().parent
+COMPONENTS = BASE / 'components'
+YTDLP_DIR = COMPONENTS / 'yt-dlp'
+FFMPEG_BIN = COMPONENTS / 'ffmpeg' / 'bin'
+FFMPEG_EXE = FFMPEG_BIN / 'ffmpeg.exe'
+FFPROBE_EXE = FFMPEG_BIN / 'ffprobe.exe'
+FFMPEG_URL = 'https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip'
 
 
-# LOCAL YT-DLP IMPORT
-def find_ytdlp():
-    # Check our local component folder first
-    if os.path.isdir(YTDLP_FOLDER):
-        for root, dirs, files in os.walk(YTDLP_FOLDER):
-            if "__init__.py" in files:
-                if root not in sys.path:
-                    sys.path.insert(0, root)
-                try:
-                    import yt_dlp
-                    return yt_dlp
-                except ImportError:
-                    pass
+class Cancelled(Exception):
+    pass
 
-    # Check normal Python installation
+
+def local_ytdlp():
+    """Import the bundled package only; never mistake a global install for a local one."""
+    if not (YTDLP_DIR / 'yt_dlp' / '__init__.py').is_file():
+        return None
+    if str(YTDLP_DIR) not in sys.path:
+        sys.path.insert(0, str(YTDLP_DIR))
+    importlib.invalidate_caches()
     try:
-        import yt_dlp
-        return yt_dlp
-    except ImportError:
+        return importlib.import_module('yt_dlp')
+    except (ImportError, OSError):
         return None
 
 
-# DOWNLOAD YT-DLP LOCALLY
-def download_ytdlp():
-    os.makedirs(YTDLP_FOLDER, exist_ok=True)
-    zip_path = os.path.join(COMPONENTS_FOLDER, "yt-dlp.zip")
-    download_url = (
-        "https://files.pythonhosted.org/packages/"
-        "source/y/yt-dlp/yt_dlp-latest.tar.gz"
-    )
+def installed():
+    return local_ytdlp() is not None and FFMPEG_EXE.is_file() and FFPROBE_EXE.is_file()
 
-    # PyPI source URL can change, so use pip to download the package without installing it.
+
+def valid_youtube_url(value):
     try:
-        os.makedirs(COMPONENTS_FOLDER, exist_ok=True)
-        subprocess.check_call([sys.executable, "-m", "pip", "download", "--no-deps", "--only-binary=:all:", "-d", YTDLP_FOLDER, "yt-dlp"])
-
-        # Find downloaded wheel
-        wheel = None
-        for file in os.listdir(YTDLP_FOLDER):
-            if file.lower().endswith(".whl"):
-                wheel = os.path.join(YTDLP_FOLDER, file)
-                break
-
-        if not wheel:
-            raise Exception("Could not download the yt-dlp package.")
-
-        # Extract wheel
-        extract_folder = os.path.join(YTDLP_FOLDER, "package")
-        os.makedirs(extract_folder, exist_ok=True)
-        with zipfile.ZipFile(wheel, "r") as archive:
-            archive.extractall(extract_folder)
-
-        # Remove wheel
-        try:
-            os.remove(wheel)
-        except Exception:
-            pass
-
-        # Locate yt_dlp package
-        package_location = None
-        for root, dirs, files in os.walk(extract_folder):
-            if os.path.basename(root) == "yt_dlp" and "__init__.py" in files:
-                package_location = root
-                break
-
-        if not package_location:
-            raise Exception("Could not locate yt-dlp after downloading it.")
-
-        # Move yt_dlp into component folder
-        final_package = os.path.join(YTDLP_FOLDER, "yt_dlp")
-        if os.path.exists(final_package):
-            shutil.rmtree(final_package)
-        shutil.copytree(package_location, final_package)
-
-        # Remove temporary extraction
-        try:
-            shutil.rmtree(extract_folder)
-        except Exception:
-            pass
-
-        # Add local folder to Python path
-        if YTDLP_FOLDER not in sys.path:
-            sys.path.insert(0, YTDLP_FOLDER)
-
-        # Import
-        import yt_dlp
-        return yt_dlp
-
-    except Exception as e:
-        raise Exception("Unable to download yt-dlp.\n\n" + str(e))
+        parsed = urllib.parse.urlsplit(value)
+        host = (parsed.hostname or '').lower().rstrip('.')
+        return parsed.scheme in ('https', 'http') and host in (
+            'youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com',
+            'youtube-nocookie.com', 'www.youtube-nocookie.com', 'youtu.be', 'www.youtu.be'
+        ) and bool(parsed.path.strip('/'))
+    except ValueError:
+        return False
 
 
-# DOWNLOAD PORTABLE FFMPEG
-def download_ffmpeg():
-    os.makedirs(FFMPEG_FOLDER, exist_ok=True)
-    os.makedirs(FFMPEG_BIN, exist_ok=True)
-    zip_path = os.path.join(FFMPEG_FOLDER, "ffmpeg.zip")
-
-    # Portable Windows FFmpeg build
-    download_url = "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip"
-
-    try:
-        urllib.request.urlretrieve(download_url, zip_path)
-
-        # Extract archive
-        with zipfile.ZipFile(zip_path, "r") as archive:
-            archive.extractall(FFMPEG_FOLDER)
-
-        # Locate both executables
-        found_ffmpeg = None
-        found_ffprobe = None
-        for current_root, dirs, files in os.walk(FFMPEG_FOLDER):
-            if "ffmpeg.exe" in files:
-                found_ffmpeg = os.path.join(current_root, "ffmpeg.exe")
-            if "ffprobe.exe" in files:
-                found_ffprobe = os.path.join(current_root, "ffprobe.exe")
-            if found_ffmpeg and found_ffprobe:
-                break
-
-        # Verify
-        if not found_ffmpeg:
-            raise Exception("ffmpeg.exe could not be found.")
-        if not found_ffprobe:
-            raise Exception("ffprobe.exe could not be found.")
-
-        # Copy to permanent bin folder
-        shutil.copy2(found_ffmpeg, FFMPEG_EXE)
-        shutil.copy2(found_ffprobe, FFPROBE_EXE)
-
-        # Remove downloaded archive
-        try:
-            os.remove(zip_path)
-        except Exception:
-            pass
-
-        # Remove extracted FFmpeg folders/files
-        for item in os.listdir(FFMPEG_FOLDER):
-            item_path = os.path.join(FFMPEG_FOLDER, item)
-            if os.path.abspath(item_path) == os.path.abspath(FFMPEG_BIN):
-                continue
-            try:
-                if os.path.isdir(item_path):
-                    shutil.rmtree(item_path)
-                else:
-                    os.remove(item_path)
-            except Exception:
-                pass
-
-        # Final verification
-        if os.path.isfile(FFMPEG_EXE) and os.path.isfile(FFPROBE_EXE):
-            return True
-        raise Exception("FFmpeg installation could not be verified.")
-
-    except Exception as e:
-        try:
-            if os.path.exists(zip_path):
-                os.remove(zip_path)
-        except Exception:
-            pass
-        raise e
+def safe_filename(name):
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', name).rstrip(' .').strip()
+    name = name[:170].rstrip(' .') or 'YouTube Audio'
+    stem = name.split('.')[0].upper()
+    if stem in {'CON', 'PRN', 'AUX', 'NUL'} or re.fullmatch(r'(COM|LPT)[1-9]', stem):
+        name = '_' + name
+    return name
 
 
-# COMPONENT CHECK
-def components_available():
-    ytdlp = find_ytdlp()
-    ffmpeg_ready = os.path.isfile(FFMPEG_EXE) and os.path.isfile(FFPROBE_EXE)
-    return ytdlp is not None and ffmpeg_ready
-
-
-# INSTALL COMPONENTS WITH USER PERMISSION
-def install_components():
-    # Check what is missing
-    ytdlp_missing = find_ytdlp() is None
-    ffmpeg_missing = not (os.path.isfile(FFMPEG_EXE) and os.path.isfile(FFPROBE_EXE))
-
-    # Nothing missing
-    if not ytdlp_missing and not ffmpeg_missing:
-        return find_ytdlp()
-
-    # Build consent message
-    components = []
-    if ytdlp_missing:
-        components.append("yt-dlp")
-    if ffmpeg_missing:
-        components.append("FFmpeg / FFprobe")
-    component_text = "\n".join("  • " + item for item in components)
-
-    # Ask permission
-    answer = messagebox.askyesno(
-        "Components Required",
-        "This program needs the following components to be able to convert YouTube videos to MP3:\n\n"
-        f"{component_text}\n\n"
-        "These components will be downloaded to the program's own folder.\n\n"
-        "Nothing will be installed system-wide.\n\n"
-        "Would you like to proceed?"
-    )
-
-    # User said NO
-    if not answer:
-        messagebox.showinfo(APP_NAME, "No components were installed.\n\nThe converter cannot be used until the required components are installed.")
-        return None
-
-    # User said YES
-    try:
-        if ytdlp_missing:
-            status_window("Installing yt-dlp...")
-            ytdlp = download_ytdlp()
-        else:
-            ytdlp = find_ytdlp()
-
-        if ffmpeg_missing:
-            status_window("Downloading FFmpeg...")
-            download_ffmpeg()
-
-        # Final verification
-        ytdlp = find_ytdlp()
-        if ytdlp is None:
-            raise Exception("yt-dlp could not be installed.")
-        if not (os.path.isfile(FFMPEG_EXE) and os.path.isfile(FFPROBE_EXE)):
-            raise Exception("FFmpeg and FFprobe could not be installed.")
-
-        close_status_window()
-        messagebox.showinfo(APP_NAME, "All required components have been installed.\n\nYou are ready to use the converter.")
-        return ytdlp
-
-    except Exception as e:
-        close_status_window()
-        messagebox.showerror("Installation Error", "The required components could not be installed.\n\n" + str(e))
-        return None
-
-
-# INSTALLATION STATUS WINDOW
-installation_window = None
-installation_label = None
-
-def status_window(text):
-    global installation_window, installation_label
-    if installation_window is None:
-        installation_window = tk.Toplevel()
-        installation_window.configure(bg=BG_COLOR)
-        installation_window.title(APP_NAME)
-        installation_window.geometry("400x130")
-        installation_window.resizable(False, False)
-        installation_window.transient()
-        installation_window.grab_set()
-        installation_label = tk.Label(installation_window, text=text, font=("Segoe UI", 12), wraplength=350, bg=BG_COLOR, fg=FG_COLOR)
-        installation_label.pack(expand=True)
-    else:
-        installation_label.config(text=text)
-    installation_window.update()
-
-def close_status_window():
-    global installation_window
-    if installation_window:
-        try:
-            installation_window.grab_release()
-        except Exception:
-            pass
-        installation_window.destroy()
-        installation_window = None
-
-
-# MAIN APPLICATION
-class YouTubeToMP3:
-    def __init__(self, root, ytdlp):
+class App:
+    def __init__(self, root):
         self.root = root
-        self.ytdlp = ytdlp
         self.root.title(APP_NAME)
+        self.root.configure(bg=BG)
+        self.root.geometry('740x495')
+        self.root.minsize(680, 465)
+        self.running = False
+        self.cancel_event = threading.Event()
+        self.ytdlp = None
+        self.worker = None
+        self.save_path = None
+        self.temp_prefix = None
+        self.progress_value = tk.DoubleVar(value=0)
+        self.quality = tk.StringVar(value='192')
+        self.artwork = tk.BooleanVar(value=True)
+        self.last_folder = str(Path.home() / 'Music') if (Path.home() / 'Music').is_dir() else str(Path.home())
+        self._build()
+        self.root.protocol('WM_DELETE_WINDOW', self.on_close)
+        self.root.after(100, self.check_components)
 
-        # Dark mode
-        self.root.configure(bg=BG_COLOR)
+    def _build(self):
         style = ttk.Style()
         try:
-            style.theme_use("clam")
+            style.theme_use('clam')
         except tk.TclError:
             pass
-        style.configure("Dark.Horizontal.TProgressbar", troughcolor=PROGRESS_TROUGH, background=FG_COLOR, bordercolor=PROGRESS_BG, lightcolor=FG_COLOR, darkcolor=FG_COLOR)
+        style.configure('Green.Horizontal.TProgressbar', troughcolor='#292929', background=GREEN,
+                        bordercolor='#292929', lightcolor=GREEN, darkcolor=GREEN)
+        style.configure('Dark.TCombobox', fieldbackground=ENTRY, background=BUTTON, foreground=FG,
+                        arrowcolor=FG, selectbackground=ENTRY, selectforeground=FG)
+        style.configure('Dark.TCheckbutton', background=BG, foreground=FG)
+        style.map('Dark.TCheckbutton', background=[('active', BG)], foreground=[('active', FG)])
+        border = tk.Frame(self.root, bg=GREEN, padx=2, pady=2)
+        border.pack(fill='both', expand=True, padx=12, pady=12)
+        body = tk.Frame(border, bg=BG, padx=23, pady=16)
+        body.pack(fill='both', expand=True)
+        tk.Label(body, text=APP_NAME, font=('Segoe UI', 26, 'bold'), bg=BG, fg=FG).pack()
+        tk.Label(body, text='Paste a YouTube video URL to convert its audio to MP3.',
+                 font=('Segoe UI', 11), bg=BG, fg=MUTED).pack(pady=(2, 16))
+        url_row = tk.Frame(body, bg=BG)
+        url_row.pack(fill='x')
+        self.url_entry = tk.Entry(url_row, font=('Segoe UI', 12), bg=ENTRY, fg=FG,
+                                  insertbackground=FG, relief='flat', highlightthickness=1,
+                                  highlightbackground=GREEN, highlightcolor=GREEN)
+        self.url_entry.pack(side='left', fill='x', expand=True, ipady=8)
+        self.convert_btn = self.button(url_row, 'Convert', self.start_conversion, 12)
+        self.convert_btn.pack(side='left', padx=(10, 0))
+        self.url_entry.bind('<Return>', lambda _event: self.start_conversion())
+        self.setup_url_context_menu()
 
-        self.root.geometry("700x400")
-        self.root.resizable(False, False)
-        self.center_window()
+        settings = tk.Frame(body, bg=BG)
+        settings.pack(fill='x', pady=(15, 5))
+        tk.Label(settings, text='MP3 quality:', bg=BG, fg=FG, font=('Segoe UI', 10)).pack(side='left')
+        self.quality_box = ttk.Combobox(settings, textvariable=self.quality, state='readonly',
+                                         values=('128', '192', '256', '320'), width=6,
+                                         style='Dark.TCombobox')
+        self.quality_box.pack(side='left', padx=(8, 5))
+        tk.Label(settings, text='kbps', bg=BG, fg=MUTED).pack(side='left')
+        self.artwork_check = ttk.Checkbutton(settings, text='Embed title, artist and thumbnail',
+                                              variable=self.artwork, style='Dark.TCheckbutton')
+        self.artwork_check.pack(side='right')
+        tk.Label(body, text='Higher MP3 bitrates do not improve the original audio quality.',
+                 font=('Segoe UI', 9), bg=BG, fg=MUTED).pack(anchor='w', pady=(0, 12))
 
-        # OUTER BORDER / MAIN FRAME
-        # The outer frame creates a visible border around the entire converter interface.
-        outer_frame = tk.Frame(self.root, bg=BORDER_COLOR, padx=2, pady=2)
-        outer_frame.pack(fill="both", expand=True, padx=12, pady=12)
-
-        main_frame = tk.Frame(outer_frame, padx=25, pady=20, bg=BG_COLOR)
-        main_frame.pack(fill="both", expand=True)
-
-        # TITLE
-        title = tk.Label(main_frame, text="YouTube to MP3 Converter", font=("Segoe UI", 32, "bold"), bg=BG_COLOR, fg=FG_COLOR)
-        title.pack(pady=(0, 8))
-
-        # DESCRIPTION
-        description = tk.Label(main_frame, text="Just paste the URL of the YouTube video to\nconvert it to a .mp3 file.", font=("Segoe UI", 14), bg=BG_COLOR, fg=FG_COLOR)
-        description.pack()
-
-        # SIGNATURE
-        signature = tk.Label(main_frame, text="Enjoy...      -coRpSE", font=("Segoe UI", 12), bg=BG_COLOR, fg=FG_COLOR)
-        signature.pack(pady=(2, 20))
-
-        # URL FRAME
-        url_frame = tk.Frame(main_frame, bg=BG_COLOR)
-        url_frame.pack(fill="x")
-
-        # URL ENTRY
-        self.url_entry = tk.Entry(url_frame, font=("Segoe UI", 14), bg=ENTRY_BG, fg=FG_COLOR, insertbackground=FG_COLOR, selectbackground=BUTTON_ACTIVE, selectforeground=FG_COLOR, relief="flat", highlightthickness=1, highlightbackground=BORDER_COLOR, highlightcolor=FG_COLOR)
-        self.url_entry.pack(side="left", fill="x", expand=True, ipady=7)
-
-        # CONVERT BUTTON
-        self.convert_button = tk.Button(url_frame, text="Convert", font=("Segoe UI", 14, "bold"), padx=22, pady=5, command=self.start_conversion, bg=BUTTON_BG, fg=FG_COLOR, activebackground=BUTTON_ACTIVE, activeforeground=FG_COLOR, relief="flat", bd=0, cursor="hand2")
-        self.convert_button.pack(side="left", padx=(10, 0))
-
-        # STATUS
-        self.status_label = tk.Label(main_frame, text="Ready", font=("Segoe UI", 11), bg=BG_COLOR, fg=STATUS_COLOR)
-        self.status_label.pack(pady=(20, 5))
-
-        # PROGRESS BAR
-        self.progress = ttk.Progressbar(main_frame, mode="indeterminate", style="Dark.Horizontal.TProgressbar")
-        self.progress.pack(fill="x", pady=(0, 15))
-
-        # REMOVE COMPONENTS BUTTON
-        self.remove_button = tk.Button(main_frame, text="Remove Installed Components", font=("Segoe UI", 10), command=self.remove_components, bg=BUTTON_BG, fg=FG_COLOR, activebackground=BUTTON_ACTIVE, activeforeground=FG_COLOR, relief="flat", bd=0, cursor="hand2")
-        self.remove_button.pack()
-
-        # ENTER KEY
-        self.url_entry.bind("<Return>", lambda event: self.start_conversion())
+        self.status_label = tk.Label(body, text='Ready', font=('Segoe UI', 11), bg=BG, fg=GREEN)
+        self.status_label.pack(pady=(5, 5))
+        self.progress = ttk.Progressbar(body, variable=self.progress_value, maximum=100,
+                                         mode='determinate', style='Green.Horizontal.TProgressbar')
+        self.progress.pack(fill='x', pady=(0, 6))
+        self.detail_label = tk.Label(body, text='', font=('Segoe UI', 9), bg=BG, fg=MUTED)
+        self.detail_label.pack(pady=(0, 12))
+        actions = tk.Frame(body, bg=BG)
+        actions.pack(fill='x')
+        self.cancel_btn = self.button(actions, 'Cancel', self.cancel_conversion)
+        self.cancel_btn.pack(side='left')
+        self.cancel_btn.config(state='disabled')
+        self.open_btn = self.button(actions, 'Open Save Folder', self.open_folder)
+        self.open_btn.pack(side='left', padx=(10, 0))
+        self.open_btn.config(state='disabled')
+        self.manage_btn = self.button(actions, 'Manage Components', self.manage_components)
+        self.manage_btn.pack(side='right')
+        self.components_label = tk.Label(body, text='Checking components...', bg=BG, fg=MUTED,
+                                          font=('Segoe UI', 9))
+        self.components_label.pack(side='bottom', pady=(12, 0))
         self.url_entry.focus_set()
 
-    # CENTER WINDOW
-    def center_window(self):
-        self.root.update_idletasks()
-        width = self.root.winfo_width()
-        height = self.root.winfo_height()
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-        x = int((screen_width - width) / 2)
-        y = int((screen_height - height) / 2)
-        self.root.geometry(f"{width}x{height}+{x}+{y}")
-
-    # START CONVERSION
-    def start_conversion(self):
-        url = self.url_entry.get().strip()
-        if not url:
-            messagebox.showerror(APP_NAME, "Please paste a YouTube URL first.")
-            self.url_entry.focus_set()
-            return
-
-        # Basic URL validation
-        if "youtube.com" not in url and "youtu.be" not in url:
-            messagebox.showerror(APP_NAME, "Please enter a valid YouTube URL.")
-            self.url_entry.focus_set()
-            return
-
-        # Disable controls
-        self.convert_button.config(state="disabled")
-        self.url_entry.config(state="disabled")
-        self.remove_button.config(state="disabled")
-        self.status_label.config(text="Getting video information...")
-        self.progress.start(10)
-
-        # Background thread
-        thread = threading.Thread(target=self.prepare_conversion, args=(url,), daemon=True)
-        thread.start()
-
-    # PREPARE CONVERSION
-    def prepare_conversion(self, url):
-        try:
-            self.update_status("Getting video information...")
-            options = {"quiet": True, "no_warnings": True, "noplaylist": True}
-            with self.ytdlp.YoutubeDL(options) as ydl:
-                info = ydl.extract_info(url, download=False)
-            
-            title = info.get("title", "YouTube Audio")
-            title = self.clean_filename(title)
-            self.root.after(0, lambda: self.ask_save_location(url, title))
-        except Exception as e:
-            self.show_error("Error", str(e))
-            self.root.after(0, self.reset_gui)
-
-    # ASK SAVE LOCATION
-    def ask_save_location(self, url, title):
-        self.progress.stop()
-        save_location = filedialog.asksaveasfilename(
-            title="Save MP3 File", defaultextension=".mp3", initialfile=title + ".mp3",
-            filetypes=[("MP3 Audio", "*.mp3"), ("All Files", "*.*")]
+    def setup_url_context_menu(self):
+        """Readable right-click menu with consistent hover colors."""
+        menu = tk.Menu(
+            self.root, tearoff=False, font=('Segoe UI', 11),
+            bg=ENTRY, fg=FG, activebackground='#444444',
+            activeforeground='#FFFFFF', disabledforeground='#999999',
+            selectcolor=GREEN, borderwidth=1, relief='solid',
+            activeborderwidth=0,
         )
 
-        if not save_location:
-            self.reset_gui()
-            return
+        def edit(action):
+            # Leave menu entries enabled so every item has the same hover
+            # styling. An unavailable action simply does nothing.
+            entry = self.url_entry
+            if action == 'select_all':
+                entry.select_range(0, tk.END)
+                entry.icursor(tk.END)
+                entry.focus_set()
+            elif action in ('cut', 'copy'):
+                if entry.selection_present():
+                    entry.event_generate('<<Cut>>' if action == 'cut' else '<<Copy>>')
+            elif action == 'paste':
+                try:
+                    entry.clipboard_get()
+                except tk.TclError:
+                    return
+                entry.event_generate('<<Paste>>')
 
-        self.progress.start(10)
-        self.status_label.config(text="Downloading audio...")
+        menu.add_command(label='Cut', command=lambda: edit('cut'))
+        menu.add_command(label='Copy', command=lambda: edit('copy'))
+        menu.add_command(label='Paste', command=lambda: edit('paste'))
+        menu.add_separator()
+        menu.add_command(label='Select All', command=lambda: edit('select_all'))
+        self.url_context_menu = menu
 
-        thread = threading.Thread(target=self.convert_video, args=(url, save_location), daemon=True)
-        thread.start()
+        def show_menu(event):
+            if str(self.url_entry.cget('state')) == 'disabled':
+                return 'break'
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+            return 'break'
 
-    # CONVERT VIDEO
-    def convert_video(self, url, save_location):
-        try:
-            output_directory = os.path.dirname(save_location)
-            filename = os.path.splitext(os.path.basename(save_location))[0]
-            output_template = os.path.join(output_directory, filename + ".%(ext)s")
+        self.url_entry.bind('<Button-3>', show_menu)
+        self.url_entry.bind('<Control-a>', lambda _event: (self.url_entry.select_range(0, tk.END), 'break')[1])
 
-            # yt-dlp options
-            options = {
-                "format": "bestaudio/best", "outtmpl": output_template, "noplaylist": True,
-                "ffmpeg_location": FFMPEG_BIN,
-                "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
-                "progress_hooks": [self.progress_hook], "quiet": True, "no_warnings": True
-            }
+    def button(self, parent, text, command, font_size=10):
+        return tk.Button(parent, text=text, command=command, font=('Segoe UI', font_size),
+                         bg=BUTTON, fg=FG, activebackground='#444444', activeforeground=FG,
+                         relief='flat', padx=12, pady=7, cursor='hand2')
 
-            # Download
-            with self.ytdlp.YoutubeDL(options) as ydl:
-                ydl.download([url])
+    def ui(self, fn):
+        # All UI callbacks are executed by the Tk main loop.
+        self.root.after(0, fn)
 
-            # Verify MP3
-            final_file = os.path.join(output_directory, filename + ".mp3")
-            if not os.path.isfile(final_file):
-                raise Exception("The MP3 file could not be found after conversion.")
+    def status(self, message, detail=None, percent=None):
+        def apply():
+            self.status_label.config(text=message)
+            if detail is not None:
+                self.detail_label.config(text=detail)
+            if percent is not None:
+                self.progress_value.set(max(0, min(100, percent)))
+        self.ui(apply)
 
-            # Success
-            self.update_status("Conversion complete!")
-            self.root.after(0, lambda: self.show_success_and_clear(final_file))
+    def set_busy(self, busy):
+        self.running = busy
+        state = 'disabled' if busy else 'normal'
+        self.convert_btn.config(state=state)
+        self.url_entry.config(state=state)
+        self.manage_btn.config(state=state)
+        self.quality_box.config(state='disabled' if busy else 'readonly')
+        self.artwork_check.config(state=state)
+        self.cancel_btn.config(state='normal' if busy else 'disabled')
 
-        except Exception as e:
-            self.update_status("Conversion failed.")
-            self.show_error("Conversion Error", str(e))
-        finally:
-            self.root.after(0, self.reset_gui)
-
-    # SUCCESS MESSAGE + CLEAR URL
-    def show_success_and_clear(self, final_file):
-        messagebox.showinfo("Success", f"The MP3 was successfully created!\n\nSaved to:\n{final_file}")
-        # Clear the URL after the success message has been dismissed.
-        self.url_entry.delete(0, tk.END)
-        self.status_label.config(text="Ready")
-
-    # PROGRESS
-    def progress_hook(self, data):
-        status = data.get("status")
-        if status == "downloading":
-            downloaded = data.get("downloaded_bytes", 0)
-            total = data.get("total_bytes")
-            if total:
-                percent = (downloaded / total) * 100
-                self.update_status(f"Downloading... {percent:.1f}%")
+    def check_components(self):
+        self.ytdlp = local_ytdlp()
+        ready = self.ytdlp is not None and FFMPEG_EXE.is_file() and FFPROBE_EXE.is_file()
+        self.components_label.config(text='yt-dlp / FFmpeg: Installed' if ready else 'Components: Not installed')
+        if not ready:
+            if messagebox.askyesno('Components Required',
+                    'This program needs yt-dlp, FFmpeg and FFprobe.\n\n'
+                    'They will be downloaded into the program\'s components folder only.\n'
+                    'No system-wide installation is performed.\n\nDownload now?'):
+                self.install_dependencies()
             else:
-                self.update_status("Downloading...")
-        elif status == "finished":
-            self.update_status("Download complete. Converting to MP3...")
+                self.status_label.config(text='Components required before converting.')
 
-    # REMOVE COMPONENTS
-    def remove_components(self):
-        answer = messagebox.askyesno(
-            "Remove Installed Components",
-            "This will remove the components installed by this program:\n\n"
-            "  • yt-dlp\n  • FFmpeg\n  • FFprobe\n\n"
-            "Your MP3 files will NOT be deleted.\n\n"
-            "Are you sure you want to remove them?"
-        )
-        if not answer:
+    def start_worker(self, function, *args):
+        self.cancel_event.clear()
+        self.set_busy(True)
+        self.worker = threading.Thread(target=function, args=args, daemon=True)
+        self.worker.start()
+
+    def finish_worker(self, message, detail='', error=None):
+        def done():
+            self.set_busy(False)
+            self.status_label.config(text=message)
+            self.detail_label.config(text=detail)
+            if error:
+                messagebox.showerror(APP_NAME, str(error))
+        self.ui(done)
+
+    def download_file(self, url, destination):
+        request = urllib.request.Request(url, headers={'User-Agent': 'YT2MP3-Converter/2.0'})
+        with urllib.request.urlopen(request, timeout=45) as response, open(destination, 'wb') as out:
+            total = int(response.headers.get('Content-Length') or 0)
+            count = 0
+            while True:
+                if self.cancel_event.is_set():
+                    raise Cancelled()
+                block = response.read(1024 * 512)
+                if not block:
+                    break
+                out.write(block)
+                count += len(block)
+                if total:
+                    self.status('Downloading FFmpeg...', f'{count / 1048576:.1f} / {total / 1048576:.1f} MB', 100 * count / total)
+                else:
+                    self.status('Downloading FFmpeg...', f'{count / 1048576:.1f} MB')
+
+    def install_dependencies(self, update=False):
+        if self.running:
             return
+        self.progress_value.set(0)
+        self.start_worker(self._install_worker, update)
 
-        # Remove component folder
+    def _install_worker(self, update):
         try:
-            if os.path.exists(COMPONENTS_FOLDER):
-                shutil.rmtree(COMPONENTS_FOLDER)
-            messagebox.showinfo("Components Removed", "The installed components have been removed.")
+            COMPONENTS.mkdir(parents=True, exist_ok=True)
+            if update or local_ytdlp() is None:
+                self.status('Downloading yt-dlp...', 'This may take a moment.', 0)
+                with tempfile.TemporaryDirectory(dir=str(COMPONENTS)) as tmp:
+                    command = [sys.executable, '-m', 'pip', 'download', '--disable-pip-version-check',
+                               '--no-deps', '--only-binary=:all:', '-d', tmp, 'yt-dlp']
+                    result = subprocess.run(command, capture_output=True, text=True, timeout=180)
+                    if result.returncode:
+                        raise RuntimeError('yt-dlp download failed.\n' + (result.stderr or result.stdout)[-1000:])
+                    wheels = list(Path(tmp).glob('*.whl'))
+                    if not wheels:
+                        raise RuntimeError('yt-dlp wheel not found after download.')
+                    stage = Path(tmp) / 'unpacked'
+                    stage.mkdir()
+                    with zipfile.ZipFile(wheels[0]) as archive:
+                        # Only yt_dlp package files, and reject unsafe paths.
+                        for item in archive.infolist():
+                            parts = Path(item.filename).parts
+                            if not parts or parts[0] != 'yt_dlp' or '..' in parts or item.is_dir():
+                                continue
+                            target = stage.joinpath(*parts)
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            with archive.open(item) as src, open(target, 'wb') as dst:
+                                shutil.copyfileobj(src, dst)
+                    source = stage / 'yt_dlp'
+                    if not (source / '__init__.py').exists():
+                        raise RuntimeError('Downloaded yt-dlp package is incomplete.')
+                    target = YTDLP_DIR / 'yt_dlp'
+                    YTDLP_DIR.mkdir(parents=True, exist_ok=True)
+                    # Keep the old version until the new download has succeeded.
+                    backup = YTDLP_DIR / 'yt_dlp_backup'
+                    if backup.exists():
+                        shutil.rmtree(backup)
+                    if target.exists():
+                        target.rename(backup)
+                    try:
+                        shutil.copytree(source, target)
+                    except Exception:
+                        if target.exists():
+                            shutil.rmtree(target)
+                        if backup.exists():
+                            backup.rename(target)
+                        raise
+                    if backup.exists():
+                        shutil.rmtree(backup)
+            if self.cancel_event.is_set():
+                raise Cancelled()
+            if not FFMPEG_EXE.is_file() or not FFPROBE_EXE.is_file():
+                self.status('Downloading FFmpeg...', 'Downloading portable Windows binaries...', 0)
+                with tempfile.TemporaryDirectory(dir=str(COMPONENTS)) as tmp:
+                    archive_path = Path(tmp) / 'ffmpeg.zip'
+                    self.download_file(FFMPEG_URL, archive_path)
+                    with zipfile.ZipFile(archive_path) as archive:
+                        candidates = {}
+                        for item in archive.infolist():
+                            basename = Path(item.filename).name.lower()
+                            if basename in ('ffmpeg.exe', 'ffprobe.exe') and not item.is_dir():
+                                candidates[basename] = item
+                        if len(candidates) != 2:
+                            raise RuntimeError('FFmpeg archive does not contain both required executables.')
+                        FFMPEG_BIN.mkdir(parents=True, exist_ok=True)
+                        for name, item in candidates.items():
+                            if self.cancel_event.is_set():
+                                raise Cancelled()
+                            target = FFMPEG_BIN / name
+                            staged = Path(tmp) / name
+                            with archive.open(item) as src, open(staged, 'wb') as dst:
+                                shutil.copyfileobj(src, dst)
+                            os.replace(staged, target)
+            if self.cancel_event.is_set():
+                raise Cancelled()
+            self.ui(self._installation_success)
+        except Cancelled:
+            self.finish_worker('Installation cancelled.')
+        except Exception as exc:
+            self.finish_worker('Component installation failed.', error=exc)
 
-            # Disable converter because dependencies are no longer available.
-            self.convert_button.config(state="disabled")
-            self.remove_button.config(state="disabled")
-            self.status_label.config(text="Components removed.\nYou need to restart program to rininstall components.")
-        except Exception as e:
-            messagebox.showerror("Removal Error", "The components could not be completely removed.\n\n" + str(e))
+    def _installation_success(self):
+        self.ytdlp = local_ytdlp()
+        if self.ytdlp is None or not FFMPEG_EXE.is_file() or not FFPROBE_EXE.is_file():
+            self.set_busy(False)
+            messagebox.showerror(APP_NAME, 'Components could not be verified. Restart and try again.')
+            return
+        self.set_busy(False)
+        self.progress_value.set(0)
+        self.status_label.config(text='Ready')
+        self.detail_label.config(text='')
+        self.components_label.config(text='yt-dlp / FFmpeg: Installed')
+        messagebox.showinfo(APP_NAME, 'Components are ready to use.')
 
-    # CLEAN WINDOWS FILENAME
-    def clean_filename(self, filename):
-        filename = re.sub(r'[<>:"/\\|?*]', "", filename)
-        filename = re.sub(r"[\x00-\x1f]", "", filename)
-        filename = filename.rstrip(". ")
-        if not filename:
-            filename = "YouTube Audio"
+    def start_conversion(self):
+        if self.running:
+            return
+        url = self.url_entry.get().strip()
+        if not valid_youtube_url(url):
+            messagebox.showerror(APP_NAME, 'Please enter a valid YouTube video URL.')
+            return
+        if not installed():
+            messagebox.showerror(APP_NAME, 'Required components are missing. Use Manage Components to install them.')
+            return
+        self.progress_value.set(0)
+        self.detail_label.config(text='')
+        self.start_worker(self._fetch_info, url)
 
-        reserved = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"}
-        if filename.upper() in reserved:
-            filename = "_" + filename
-        return filename
+    def _fetch_info(self, url):
+        try:
+            self.status('Getting video information...')
+            with self.ytdlp.YoutubeDL({'quiet': True, 'no_warnings': True, 'noplaylist': True,
+                                       'socket_timeout': 25, 'retries': 2}) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if self.cancel_event.is_set():
+                raise Cancelled()
+            if not info:
+                raise RuntimeError('No video information returned.')
+            title = safe_filename(info.get('title') or 'YouTube Audio')
+            self.ui(lambda: self.choose_save_path(url, title))
+        except Cancelled:
+            self.finish_worker('Cancelled.')
+        except Exception as exc:
+            self.finish_worker('Unable to get video information.', error=exc)
 
-    # UPDATE STATUS
-    def update_status(self, text):
-        self.root.after(0, lambda: self.status_label.config(text=text))
+    def choose_save_path(self, url, title):
+        self.status_label.config(text='Choose where to save the MP3...')
+        destination = filedialog.asksaveasfilename(title='Save MP3 File', defaultextension='.mp3',
+                    initialdir=self.last_folder, initialfile=title + '.mp3',
+                    filetypes=[('MP3 Audio', '*.mp3')])
+        if not destination:
+            self.set_busy(False)
+            self.status_label.config(text='Cancelled.')
+            return
+        destination = str(Path(destination).with_suffix('.mp3'))
+        if os.path.exists(destination) and not messagebox.askyesno('Overwrite existing file?',
+                f'This file already exists:\n\n{destination}\n\nReplace it?'):
+            self.set_busy(False)
+            self.status_label.config(text='Cancelled.')
+            return
+        self.last_folder = str(Path(destination).parent)
+        self.save_path = destination
+        self.progress_value.set(0)
+        self.status_label.config(text='Downloading audio...')
+        self.cancel_event.clear()
+        quality = self.quality.get()
+        embed_artwork = self.artwork.get()
+        self.worker = threading.Thread(target=self._convert_worker, args=(url, destination, quality, embed_artwork), daemon=True)
+        self.worker.start()
 
-    # SHOW ERROR
-    def show_error(self, title, message):
-        self.root.after(0, lambda: messagebox.showerror(title, message))
+    def _convert_worker(self, url, destination, quality, embed_artwork):
+        # Download into a temporary directory to avoid overwriting the target on failure.
+        try:
+            with tempfile.TemporaryDirectory(prefix='yt2mp3-', dir=str(Path(destination).parent)) as tmp:
+                output = str(Path(tmp) / 'audio.%(ext)s')
+                def hook(data):
+                    if self.cancel_event.is_set():
+                        raise Cancelled()
+                    state = data.get('status')
+                    if state == 'downloading':
+                        current = data.get('downloaded_bytes', 0)
+                        total = data.get('total_bytes') or data.get('total_bytes_estimate')
+                        speed = data.get('speed')
+                        eta = data.get('eta')
+                        detail = f'{current / 1048576:.1f} MB'
+                        if total:
+                            detail += f' / {total / 1048576:.1f} MB'
+                        if speed:
+                            detail += f'  •  {speed / 1048576:.2f} MB/s'
+                        if eta is not None:
+                            detail += f'  •  {int(eta)}s remaining'
+                        self.status('Downloading audio...', detail, current * 100 / total if total else None)
+                    elif state == 'finished':
+                        self.status('Converting to MP3...', 'Encoding audio; please wait.', 100)
+                def post_hook(data):
+                    if self.cancel_event.is_set():
+                        raise Cancelled()
+                    if data.get('status') == 'started':
+                        self.status('Converting to MP3...', 'Encoding audio; please wait.', 100)
+                opts = {
+                    'format': 'bestaudio/best', 'outtmpl': output, 'noplaylist': True,
+                    'ffmpeg_location': str(FFMPEG_BIN), 'quiet': True, 'no_warnings': True,
+                    'overwrites': False, 'socket_timeout': 30, 'retries': 3,
+                    'progress_hooks': [hook], 'postprocessor_hooks': [post_hook],
+                    'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3',
+                                        'preferredquality': quality}],
+                }
+                if embed_artwork:
+                    opts['writethumbnail'] = True
+                    opts['postprocessors'] += [
+                        {'key': 'FFmpegMetadata', 'add_metadata': True},
+                        {'key': 'EmbedThumbnail', 'already_have_thumbnail': False},
+                    ]
+                with self.ytdlp.YoutubeDL(opts) as ydl:
+                    ydl.download([url])
+                if self.cancel_event.is_set():
+                    raise Cancelled()
+                converted = Path(tmp) / 'audio.mp3'
+                if not converted.is_file():
+                    raise RuntimeError('The converted MP3 could not be found.')
+                # Atomic replacement on the same volume; existing target survives failed conversion.
+                os.replace(converted, destination)
+            self.ui(lambda: self.conversion_success(destination))
+        except Cancelled:
+            self.finish_worker('Conversion cancelled.', 'Temporary download files removed.')
+        except Exception as exc:
+            self.finish_worker('Conversion failed.', error=exc)
 
-    # RESET GUI
-    def reset_gui(self):
-        self.progress.stop()
-        self.convert_button.config(state="normal")
-        self.remove_button.config(state="normal")
-        self.url_entry.config(state="normal")
-        self.url_entry.focus_set()
+    def conversion_success(self, destination):
+        self.set_busy(False)
+        self.progress_value.set(100)
+        self.status_label.config(text='Conversion complete!')
+        self.detail_label.config(text=destination)
+        self.url_entry.delete(0, tk.END)
+        self.open_btn.config(state='normal')
+        messagebox.showinfo('Success', f'MP3 created successfully!\n\nSaved to:\n{destination}')
+
+    def cancel_conversion(self):
+        if self.running:
+            self.cancel_event.set()
+            self.status_label.config(text='Cancelling...')
+            self.cancel_btn.config(state='disabled')
+
+    def open_folder(self):
+        if self.save_path and os.path.isdir(os.path.dirname(self.save_path)):
+            os.startfile(os.path.dirname(self.save_path))
+
+    def manage_components(self):
+        if self.running:
+            return
+        dlg = tk.Toplevel(self.root)
+        dlg.title('Manage Components')
+        dlg.configure(bg=BG)
+        dlg.geometry('410x240')
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        version = getattr(getattr(self.ytdlp, 'version', None), '__version__', 'Not installed')
+        tk.Label(dlg, text='Component Manager', font=('Segoe UI', 17, 'bold'),
+                 bg=BG, fg=FG).pack(pady=(15, 8))
+        tk.Label(dlg, text=f'yt-dlp: {version}\nFFmpeg: {"Installed" if FFMPEG_EXE.is_file() else "Missing"}\n'
+                           f'FFprobe: {"Installed" if FFPROBE_EXE.is_file() else "Missing"}',
+                 bg=BG, fg=MUTED, justify='left').pack()
+        buttons = tk.Frame(dlg, bg=BG)
+        buttons.pack(pady=12)
+        def do_update():
+            dlg.destroy()
+            self.install_dependencies(update=True)
+        def do_remove():
+            dlg.destroy()
+            self.remove_components()
+        self.button(buttons, 'Install / Update yt-dlp', do_update).pack(side='left', padx=5)
+        self.button(buttons, 'Remove Components', do_remove).pack(side='left', padx=5)
+        tk.Label(dlg, text='Updates require internet access and may take a moment.',
+                 bg=BG, fg=MUTED, font=('Segoe UI', 9)).pack()
+
+    def remove_components(self):
+        if self.running:
+            return
+        if not messagebox.askyesno('Remove Components',
+                'Remove locally downloaded yt-dlp, FFmpeg and FFprobe?\n\nYour MP3 files will not be deleted.'):
+            return
+        try:
+            if COMPONENTS.exists():
+                shutil.rmtree(COMPONENTS)
+            self.ytdlp = None
+            self.components_label.config(text='Components: Not installed')
+            self.status_label.config(text='Components removed. Restart or use Manage Components to reinstall.')
+            messagebox.showinfo(APP_NAME, 'Components removed. Restart the program before reinstalling yt-dlp.')
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f'Unable to remove components:\n{exc}')
+
+    def on_close(self):
+        if self.running:
+            if not messagebox.askyesno(APP_NAME, 'A task is still running. Cancel it and close?'):
+                return
+            self.cancel_event.set()
+        self.root.destroy()
+
 
 
 def main():
-    global installation_window
-    root = tk.Tk()
-
-    # Hide window while checking components
-    root.withdraw()
-
-    # Check/install required components
-    ytdlp = install_components()
-
-    # User declined or installation failed
-    if ytdlp is None:
-        root.destroy()
+    if os.name != 'nt':
+        print('This portable build requires Windows (FFmpeg Windows binaries).')
         return
-
-    # Show converter
-    root.deiconify()
-    app = YouTubeToMP3(root, ytdlp)
+    root = tk.Tk()
+    App(root)
     root.mainloop()
 
-# START
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()
